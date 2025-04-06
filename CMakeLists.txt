@@ -11,6 +11,8 @@ add_executable(dht22_reader
 target_link_libraries(dht22_reader
     pico_stdlib
     hardware_gpio
+    hardware_adc
+    hardware_i2c
 )
 
 pico_enable_stdio_usb(dht22_reader 1)
