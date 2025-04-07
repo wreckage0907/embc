@@ -21,7 +21,7 @@ make
 
 2. MQ135 Air Quality Sensor
 - AOUT - Pin 31
-- VCC - Pin 36
+- VCC - Pin 39
 - GND - Pin 38
 
 3. OLED Display
@@ -29,3 +29,6 @@ make
 - SDA - Pin 6
 - VCC - Pin 36
 - GND - Pin 38
+
+## PIN DIAGRAM 
+![image](https://github.com/user-attachments/assets/f8caef3f-668b-43fd-8720-bdda14e42f16)
