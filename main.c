@@ -388,25 +388,56 @@ void read_from_dht(DHT_reading *result) {
 
 // Improved MQ135 reading function with better AQI calculation and power management
 int read_mq135() {
-    // Reduce number of samples to minimize power draw
-    const int NUM_SAMPLES = 3;
+    // Take multiple readings to stabilize
+    const int NUM_SAMPLES = 10;
     int sum = 0;
     
     adc_select_input(0);  // ADC0 = GPIO 26
     
     for(int i = 0; i < NUM_SAMPLES; i++) {
         sum += adc_read();
-        sleep_ms(5);
+        sleep_ms(10);
     }
     
     int raw = sum / NUM_SAMPLES;
     
-    // Simpler AQI calculation to avoid values being too high
+    // Convert to voltage (0-3.3V)
     float voltage = (raw * 3.3) / 4095.0;
-    int aqi = (int)(voltage * 100);  // Simple scaling - adjust this as needed
     
-    // Cap maximum value
-    if (aqi > 300) aqi = 300;
+    // Better calibration for MQ135
+    // These values need to be adjusted for your specific sensor
+    float resistance = ((1023.0 / raw) - 1.0) * 10.0; // Calculate sensor resistance
+    
+    // Map resistance to ppm (approximate)
+    // Adjust these values based on your sensor's datasheet or calibration
+    float ppm;
+    if (resistance > 20.0) {
+        ppm = 400; // Approximately fresh air
+    } else if (resistance > 10.0) {
+        ppm = 500 + (20.0 - resistance) * 30;
+    } else if (resistance > 5.0) {
+        ppm = 800 + (10.0 - resistance) * 40;
+    } else if (resistance > 3.0) {
+        ppm = 1000 + (5.0 - resistance) * 50;
+    } else {
+        ppm = 1100 + (3.0 - resistance) * 100;
+    }
+    
+    // Convert PPM to AQI (very approximate)
+    int aqi;
+    if (ppm < 450) {
+        aqi = (int)((ppm - 400) / 50.0 * 50); // 0-50 (Good)
+    } else if (ppm < 700) {
+        aqi = (int)(50 + (ppm - 450) / 250.0 * 50); // 50-100 (Moderate)
+    } else if (ppm < 1000) {
+        aqi = (int)(100 + (ppm - 700) / 300.0 * 100); // 100-200 (Unhealthy)
+    } else {
+        aqi = (int)(200 + (ppm - 1000) / 1000.0 * 300); // 200-500 (Very Unhealthy to Hazardous)
+    }
+    
+    // Ensure AQI is within expected range
+    if (aqi < 0) aqi = 0;
+    if (aqi > 500) aqi = 500;
     
     return aqi;
 }
