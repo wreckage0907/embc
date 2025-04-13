@@ -5,7 +5,7 @@
 #include "hardware/adc.h"
 #include "hardware/i2c.h"
 
-// Pin definitions - CORRECTED based on actual connections
+// Pin definitions - VERIFY THESE MATCH YOUR ACTUAL CONNECTIONS
 #define DHT_PIN 16         // Connected to physical pin 21
 #define LED_PIN PICO_DEFAULT_LED_PIN
 #define MQ135_PIN 26       // Connected to physical pin 31 (ADC0)
@@ -13,7 +13,7 @@
 // I2C pins for OLED
 #define I2C_SDA_PIN 4      // Connected to physical pin 6
 #define I2C_SCL_PIN 5      // Connected to physical pin 7
-#define OLED_ADDR 0x3C     // SSD1306 address (typical: 0x3C or 0x3D)
+#define OLED_ADDR 0x3C     // SSD1306 address (try 0x3D if not working)
 
 // 0.91 inch OLED is typically 128x32
 #define OLED_WIDTH 128
@@ -120,8 +120,19 @@ void ssd1306_cmd(uint8_t cmd) {
     i2c_write_blocking(i2c0, OLED_ADDR, buf, 2, false);
 }
 
-// Function to initialize OLED
-void ssd1306_init() {
+// Function to initialize OLED with error detection
+bool ssd1306_init() {
+    // Check if OLED is responding
+    uint8_t buf[2] = {OLED_CONTROL_BYTE_CMD, OLED_CMD_DISPLAY_OFF};
+    int result = i2c_write_blocking(i2c0, OLED_ADDR, buf, 2, false);
+    
+    if (result < 0) {
+        printf("OLED not responding at address 0x%02X\n", OLED_ADDR);
+        return false;
+    }
+    
+    printf("OLED responding at address 0x%02X\n", OLED_ADDR);
+    
     ssd1306_cmd(OLED_CMD_DISPLAY_OFF);
     
     // Basic configuration for 128x32 display
@@ -158,6 +169,8 @@ void ssd1306_init() {
     // Turn on
     ssd1306_cmd(OLED_CMD_DISPLAY_NORMAL);
     ssd1306_cmd(OLED_CMD_DISPLAY_ON);
+    
+    return true;
 }
 
 // Clear display buffer
@@ -267,172 +280,164 @@ void draw_string_2x(int x, int y, const char* str) {
     }
 }
 
-// Modified DHT22 reading function with strong internal pull-up
+// Completely redesigned DHT22 reading function
 void read_from_dht(DHT_reading *result) {
     uint8_t data[5] = {0};
-    uint8_t bytes = 0;
-    uint8_t bit = 7;
+    uint32_t cycles[80] = {0};
     
     result->error = true;
+    result->temp = 0.0;
+    result->humidity = 0.0;
     
-    // Enable strong internal pull-up
+    // Output low for at least 18ms (original DHT22 spec)
     gpio_set_dir(DHT_PIN, GPIO_OUT);
-    gpio_put(DHT_PIN, 1);
-    gpio_set_pulls(DHT_PIN, true, false);  // Enable internal pull-up
-    sleep_ms(100);  // Give more time for the pull-up to stabilize
-    
-    // Start signal - more pronounced
     gpio_put(DHT_PIN, 0);
-    sleep_ms(30);  // Extended low pulse (30ms)
+    sleep_ms(20);  // 20ms for safety
     
-    // Release the line
+    // Set pin high and switch to input
     gpio_put(DHT_PIN, 1);
-    sleep_us(50);
+    sleep_us(30);  // Short delay before switching
     gpio_set_dir(DHT_PIN, GPIO_IN);
-    gpio_set_pulls(DHT_PIN, true, false);
+    gpio_set_pulls(DHT_PIN, true, false);  // Enable pull-up
     
-    // Wait for DHT response with more flexible timing
-    uint32_t timeout = 200; // Increased timeout
-    while(gpio_get(DHT_PIN) == 1) {
-        if (--timeout == 0) {
-            printf("Error: DHT not responding\n");
+    // Disable interrupts during critical timing
+    uint32_t irq_status = save_and_disable_interrupts();
+    
+    // Wait for DHT to pull down (initial response)
+    uint32_t count = 0;
+    while (gpio_get(DHT_PIN) == 1) {
+        if (++count > 10000) {
+            restore_interrupts(irq_status);
+            printf("Error: DHT not pulling down (initial response)\n");
             return;
         }
-        sleep_us(1);
     }
     
-    // Measure the response pulses with more flexible timing
-    timeout = 200;
-    while(gpio_get(DHT_PIN) == 0) {
-        if (--timeout == 0) {
-            printf("Error: DHT low pulse timeout\n");
-            return;
-        }
-        sleep_us(1);
-    }
-    
-    timeout = 200;
-    while(gpio_get(DHT_PIN) == 1) {
-        if (--timeout == 0) {
-            printf("Error: DHT high pulse timeout\n");
-            return;
-        }
-        sleep_us(1);
-    }
-    
-    // Read the 40 bits of data with more flexible timing
-    for(int i = 0; i < 40; i++) {
-        // Wait for start of bit (low pulse)
-        timeout = 200;
-        while(gpio_get(DHT_PIN) == 0) {
-            if (--timeout == 0) {
-                printf("Error: DHT bit start timeout\n");
+    // Read the 80 cycles (40 bits, each bit has a low and high cycle)
+    for (int i = 0; i < 80; i += 2) {
+        // Measure low pulse
+        count = 0;
+        while (gpio_get(DHT_PIN) == 0) {
+            if (++count > 10000) {
+                restore_interrupts(irq_status);
+                printf("Error: DHT stuck low at bit %d\n", i/2);
                 return;
             }
-            sleep_us(1);
         }
         
-        // Measure high pulse length to determine bit value
-        uint32_t start = time_us_32();
-        
-        timeout = 200;
-        while(gpio_get(DHT_PIN) == 1) {
-            if (--timeout == 0) {
-                printf("Error: DHT bit end timeout\n");
+        // Measure high pulse
+        count = 0;
+        while (gpio_get(DHT_PIN) == 1) {
+            if (++count > 10000) {
+                restore_interrupts(irq_status);
+                printf("Error: DHT stuck high at bit %d\n", i/2);
                 return;
             }
-            sleep_us(1);
+            cycles[i] = count;
         }
+    }
+    
+    // Restore interrupts
+    restore_interrupts(irq_status);
+    
+    // Process the pulse durations
+    // Find threshold between '0' and '1' bits by finding halfway point
+    uint32_t threshold = 0;
+    for (int i = 0; i < 80; i += 2) {
+        threshold += cycles[i];
+    }
+    threshold /= 40;  // Average high pulse length
+    
+    // Convert pulse durations to bits
+    for (int i = 0; i < 40; i++) {
+        uint32_t high_cycles = cycles[i * 2];
         
-        uint32_t duration = time_us_32() - start;
+        // A zero bit has a shorter high cycle than a one bit
+        uint8_t bit = (high_cycles > threshold) ? 1 : 0;
         
-        // A high pulse longer than ~40us is a '1' bit
-        // More flexible threshold (30us instead of 40us)
-        if(duration > 30) {
-            data[bytes] |= (1 << bit);
-        }
-        
-        bit--;
-        if(bit == 255) {
-            bit = 7;
-            bytes++;
-        }
+        // Add bit to byte
+        data[i / 8] <<= 1;
+        data[i / 8] |= bit;
     }
     
     // Verify checksum
-    if(bytes != 5) {
-        printf("Error: Data length incorrect\n");
+    if ((data[0] + data[1] + data[2] + data[3]) & 0xFF != data[4]) {
+        printf("Error: DHT checksum failed\n");
         return;
     }
     
-    uint8_t checksum = data[0] + data[1] + data[2] + data[3];
-    if(checksum != data[4]) {
-        printf("Error: Checksum failure (got %d, expected %d)\n", checksum, data[4]);
-        return;
-    }
-    
-    // Convert data to temperature and humidity values
+    // Convert to humidity and temperature
     result->humidity = ((data[0] << 8) + data[1]) / 10.0;
-    result->temp = ((data[2] << 8) + data[3]) / 10.0;
     
-    // Sanity check on values with more flexible ranges
-    if(result->humidity > 100 || result->humidity < 0 || 
-       result->temp > 85 || result->temp < -45) {
-        printf("Error: Values out of range (Temp: %.1f, Humidity: %.1f)\n", 
-              result->temp, result->humidity);
+    // Handle negative temperatures
+    if (data[2] & 0x80) {
+        result->temp = -((((data[2] & 0x7F) << 8) + data[3]) / 10.0);
+    } else {
+        result->temp = ((data[2] << 8) + data[3]) / 10.0;
+    }
+    
+    // Sanity check
+    if (result->humidity > 100 || result->humidity < 0 || 
+        result->temp > 80 || result->temp < -40) {
+        printf("Error: DHT values out of range (T=%.1f, H=%.1f)\n", 
+               result->temp, result->humidity);
         return;
     }
     
     result->error = false;
 }
 
-// Improved MQ135 reading function with better AQI calculation and power management
+// Improved MQ135 reading function with warm-up and better calibration
 int read_mq135() {
     // Take multiple readings to stabilize
-    const int NUM_SAMPLES = 10;
+    const int NUM_SAMPLES = 20;
     int sum = 0;
+    
+    // Static variable to track if sensor has warmed up
+    static bool is_warmed_up = false;
+    static uint32_t warmup_start = 0;
+    
+    // MQ135 needs time to warm up
+    if (!is_warmed_up) {
+        if (warmup_start == 0) {
+            warmup_start = to_ms_since_boot(get_absolute_time());
+            printf("MQ135 warming up...\n");
+        }
+        
+        uint32_t elapsed = to_ms_since_boot(get_absolute_time()) - warmup_start;
+        if (elapsed < 60000) {  // 60 seconds warm-up
+            // Return a placeholder value during warm-up
+            return (elapsed < 30000) ? 10 : 20;  // Gradual increase
+        } else {
+            is_warmed_up = true;
+            printf("MQ135 warm-up complete\n");
+        }
+    }
     
     adc_select_input(0);  // ADC0 = GPIO 26
     
     for(int i = 0; i < NUM_SAMPLES; i++) {
         sum += adc_read();
-        sleep_ms(10);
+        sleep_ms(5);
     }
     
     int raw = sum / NUM_SAMPLES;
     
-    // Convert to voltage (0-3.3V)
-    float voltage = (raw * 3.3) / 4095.0;
+    // Print the raw value to help with debugging
+    printf("MQ135 raw ADC: %d/4095\n", raw);
     
-    // Better calibration for MQ135
-    // These values need to be adjusted for your specific sensor
-    float resistance = ((1023.0 / raw) - 1.0) * 10.0; // Calculate sensor resistance
-    
-    // Map resistance to ppm (approximate)
-    // Adjust these values based on your sensor's datasheet or calibration
-    float ppm;
-    if (resistance > 20.0) {
-        ppm = 400; // Approximately fresh air
-    } else if (resistance > 10.0) {
-        ppm = 500 + (20.0 - resistance) * 30;
-    } else if (resistance > 5.0) {
-        ppm = 800 + (10.0 - resistance) * 40;
-    } else if (resistance > 3.0) {
-        ppm = 1000 + (5.0 - resistance) * 50;
-    } else {
-        ppm = 1100 + (3.0 - resistance) * 100;
-    }
-    
-    // Convert PPM to AQI (very approximate)
+    // More reliable calculation for air quality
+    // Calibrated for typical indoor CO2 levels
     int aqi;
-    if (ppm < 450) {
-        aqi = (int)((ppm - 400) / 50.0 * 50); // 0-50 (Good)
-    } else if (ppm < 700) {
-        aqi = (int)(50 + (ppm - 450) / 250.0 * 50); // 50-100 (Moderate)
-    } else if (ppm < 1000) {
-        aqi = (int)(100 + (ppm - 700) / 300.0 * 100); // 100-200 (Unhealthy)
-    } else {
-        aqi = (int)(200 + (ppm - 1000) / 1000.0 * 300); // 200-500 (Very Unhealthy to Hazardous)
+    
+    if (raw < 1000) {  // Very clean air
+        aqi = raw / 20;  // 0-50 range
+    } else if (raw < 2000) {  // Moderate
+        aqi = 50 + ((raw - 1000) / 20);  // 50-100 range
+    } else if (raw < 3000) {  // Unhealthy for sensitive groups
+        aqi = 100 + ((raw - 2000) / 10);  // 100-200 range
+    } else {  // Unhealthy to hazardous
+        aqi = 200 + ((raw - 3000) / 5);  // 200+ range
     }
     
     // Ensure AQI is within expected range
@@ -467,14 +472,39 @@ int main() {
     gpio_pull_up(I2C_SDA_PIN);
     gpio_pull_up(I2C_SCL_PIN);
     
-    // Initialize OLED display
-    ssd1306_init();
-    ssd1306_clear();
+    // Try to detect OLED - if not found, try alternative address
+    bool oled_found = false;
     
-    // Show startup message
-    draw_string(20, 12, "Initializing...");
-    ssd1306_display();
-    sleep_ms(2000);
+    printf("Trying to initialize OLED at address 0x%02X...\n", OLED_ADDR);
+    if (ssd1306_init()) {
+        oled_found = true;
+    } else {
+        // Try alternative address
+        uint8_t alt_addr = (OLED_ADDR == 0x3C) ? 0x3D : 0x3C;
+        printf("OLED not found. Trying alternative address 0x%02X...\n", alt_addr);
+        
+        OLED_ADDR = alt_addr;
+        if (ssd1306_init()) {
+            oled_found = true;
+        } else {
+            printf("OLED display not detected. Check connections.\n");
+        }
+    }
+    
+    if (oled_found) {
+        ssd1306_clear();
+        draw_string(20, 12, "System Ready");
+        ssd1306_display();
+        printf("OLED initialized successfully\n");
+    }
+    
+    // Blink LED to indicate successful startup
+    for (int i = 0; i < 3; i++) {
+        gpio_put(LED_PIN, 1);
+        sleep_ms(100);
+        gpio_put(LED_PIN, 0);
+        sleep_ms(100);
+    }
 
     DHT_reading reading;
     int display_mode = 0;  // 0=Temp, 1=Humidity, 2=AQI
@@ -486,51 +516,56 @@ int main() {
     while (1) {
         // Blink LED for activity indicator
         gpio_put(LED_PIN, 1);
-        sleep_ms(100);
-        gpio_put(LED_PIN, 0);
         
         // Read sensors
+        printf("Reading DHT sensor...\n");
         read_from_dht(&reading);
+        
         int aqi = read_mq135();
+        printf("AQI reading: %d\n", aqi);
         
-        // Clear display buffer
-        ssd1306_clear();
+        gpio_put(LED_PIN, 0);
         
-        if (display_mode == 0) {
-            // Temperature display
-            if (!reading.error) {
-                snprintf(line_buffer, sizeof(line_buffer), "T:%.1fC", reading.temp);
+        // Skip display if OLED not found
+        if (oled_found) {
+            // Clear display buffer
+            ssd1306_clear();
+            
+            if (display_mode == 0) {
+                // Temperature display
+                if (!reading.error) {
+                    snprintf(line_buffer, sizeof(line_buffer), "T:%.1fC", reading.temp);
+                } else {
+                    snprintf(line_buffer, sizeof(line_buffer), "T:ERROR");
+                }
+                
+                // Center the text
+                int text_width = strlen(line_buffer) * 12;
+                int x_pos = (OLED_WIDTH - text_width) / 2;
+                if (x_pos < 0) x_pos = 0;
+                
+                draw_string_2x(x_pos, 8, line_buffer);
+                
+                printf("Temperature: %.1f°C\n", reading.temp);
+            } else if (display_mode == 1) {
+                // Humidity display
+                if (!reading.error) {
+                    snprintf(line_buffer, sizeof(line_buffer), "H:%.1f%%", reading.humidity);
+                } else {
+                    snprintf(line_buffer, sizeof(line_buffer), "H:ERROR");
+                }
+                
+                // Center the text
+                int text_width = strlen(line_buffer) * 12;
+                int x_pos = (OLED_WIDTH - text_width) / 2;
+                if (x_pos < 0) x_pos = 0;
+                
+                draw_string_2x(x_pos, 8, line_buffer);
+                
+                printf("Humidity: %.1f%%\n", reading.humidity);
             } else {
-                snprintf(line_buffer, sizeof(line_buffer), "T:ERROR");
-            }
-            
-            // Center the text
-            int text_width = strlen(line_buffer) * 12;
-            int x_pos = (OLED_WIDTH - text_width) / 2;
-            if (x_pos < 0) x_pos = 0;
-            
-            draw_string_2x(x_pos, 8, line_buffer);
-            
-            printf("Temperature: %.1f°C\n", reading.temp);
-        } else if (display_mode == 1) {
-            // Humidity display
-            if (!reading.error) {
-                snprintf(line_buffer, sizeof(line_buffer), "H:%.1f%%", reading.humidity);
-            } else {
-                snprintf(line_buffer, sizeof(line_buffer), "H:ERROR");
-            }
-            
-            // Center the text
-            int text_width = strlen(line_buffer) * 12;
-            int x_pos = (OLED_WIDTH - text_width) / 2;
-            if (x_pos < 0) x_pos = 0;
-            
-            draw_string_2x(x_pos, 8, line_buffer);
-            
-            printf("Humidity: %.1f%%\n", reading.humidity);
-        } else {
-            // AQI display
-            snprintf(line_buffer, sizeof(line_buffer), "AQI:%d", aqi);
+                // AQI display
+                snprintf(line_buffer, sizeof(line_buffer), "AQI:%d", aqi);
             
             // Center the text
             int text_width = strlen(line_buffer) * 12;

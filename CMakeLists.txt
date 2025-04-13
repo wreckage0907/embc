@@ -5,7 +5,7 @@ project(pico_dht22 C CXX ASM)
 pico_sdk_init()
 
 add_executable(dht22_reader
-    main.c
+    oled.c
 )
 
 target_link_libraries(dht22_reader
