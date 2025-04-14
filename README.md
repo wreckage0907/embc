@@ -31,4 +31,5 @@ make
 - GND - Pin 38
 
 ## PIN DIAGRAM 
-![image](https://github.com/user-attachments/assets/f8caef3f-668b-43fd-8720-bdda14e42f16)
+![image](https://github.com/user-attachments/assets/143e8923-cbce-4066-80ba-4512d939ae48)
+
